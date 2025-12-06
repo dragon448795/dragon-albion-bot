@@ -3,6 +3,8 @@ from discord.ext import commands
 import asyncio
 from datetime import datetime, timedelta
 import random
+import json
+import os  # 新增
 
 class Evaluation(commands.Cog):
     def __init__(self, bot):
@@ -11,31 +13,43 @@ class Evaluation(commands.Cog):
         self.user_data = {}
         self.attendance_records = {}
         
+        # ============ 新增：權限系統 ============
+        self.permissions_file = "data/evaluation_perms.json"
+        self.default_permissions = {
+            "allowed_roles": [],
+            "allowed_users": [],
+            "require_manage_guild": True,
+            "admin_only": False
+        }
+        self.permissions = self.load_permissions()
+        print(f"✅ 評核系統已初始化，已載入 {len(self.permissions)} 個伺服器權限設定")
+        # ============ 權限系統結束 ============
+        
         # 當前半月期計算
         self.current_period = self.get_current_period()
         
         # 評分權重設定
         self.rating_weights = {
-            "優秀": 1.2,    # 优秀
-            "普通": 1.0,    # 普通（預設值）
-            "待改進": 0.8,  # 待改进
-            "極差": 0.2     # 极差
+            "優秀": 1.2,
+            "普通": 1.0,
+            "待改進": 0.8,
+            "極差": 0.2
         }
         
         # 職業加成
         self.class_bonus = {
             "坦克": 1.0,
             "输出": 1.0,
-            "治疗": 1.2,    # 1.2倍加成
+            "治疗": 1.2,
             "辅助": 1.0
         }
         
         # 評分EMOJI對應
         self.rating_emojis = {
-            "⭐": "優秀",   # 星星 - 優秀
-            "🆗": "普通",   # OK - 普通
-            "⚠️": "待改進", # 警告 - 待改進
-            "❌": "極差"    # 交叉 - 極差
+            "⭐": "優秀",
+            "🆗": "普通",
+            "⚠️": "待改進",
+            "❌": "極差"
         }
         
         # 數字EMOJI對應玩家（1-50）
@@ -47,6 +61,321 @@ class Evaluation(commands.Cog):
             "🔵", "🟣", "🟤", "⚫", "⚪", "🟥", "🟧", "🟨", "🟩", "🟦"
         ]
 
+    # ============ 新增：權限系統方法 ============
+    
+    def load_permissions(self) -> dict:
+        """載入權限設定"""
+        try:
+            os.makedirs("data", exist_ok=True)
+            if os.path.exists(self.permissions_file):
+                with open(self.permissions_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except:
+            pass
+        return {}
+    
+    def save_permissions(self):
+        """保存權限設定"""
+        try:
+            with open(self.permissions_file, 'w', encoding='utf-8') as f:
+                json.dump(self.permissions, f, ensure_ascii=False, indent=2)
+        except:
+            pass
+    
+    def get_guild_permissions(self, guild_id: int) -> dict:
+        """獲取伺服器權限設定"""
+        guild_str = str(guild_id)
+        if guild_str not in self.permissions:
+            self.permissions[guild_str] = self.default_permissions.copy()
+            self.save_permissions()
+        return self.permissions[guild_str]
+    
+    def update_guild_permissions(self, guild_id: int, updates: dict):
+        """更新伺服器權限設定"""
+        guild_str = str(guild_id)
+        if guild_str not in self.permissions:
+            self.permissions[guild_str] = self.default_permissions.copy()
+        self.permissions[guild_str].update(updates)
+        self.save_permissions()
+    
+    def check_permission(self, ctx) -> bool:
+        """檢查用戶是否有權限"""
+        guild_id = ctx.guild.id
+        user = ctx.author
+        perms = self.get_guild_permissions(guild_id)
+        
+        # 如果設定為僅管理員可用
+        if perms.get("admin_only", False):
+            return user.guild_permissions.administrator
+        
+        # 伺服器管理員直接通過
+        if user.guild_permissions.administrator:
+            return True
+        
+        # 檢查是否需要管理伺服器權限
+        if perms.get("require_manage_guild", True):
+            if user.guild_permissions.manage_guild:
+                return True
+        
+        # 檢查是否在允許的用戶列表中
+        user_id_str = str(user.id)
+        if user_id_str in [str(uid) for uid in perms.get("allowed_users", [])]:
+            return True
+        
+        # 檢查是否有允許的角色
+        user_role_ids = [str(role.id) for role in user.roles]
+        allowed_role_ids = [str(rid) for rid in perms.get("allowed_roles", [])]
+        
+        for role_id in user_role_ids:
+            if role_id in allowed_role_ids:
+                return True
+        
+        return False
+    
+    def get_permission_error_message(self, ctx) -> str:
+        """獲取權限錯誤訊息"""
+        guild_id = ctx.guild.id
+        perms = self.get_guild_permissions(guild_id)
+        
+        lines = ["❌ **權限不足**"]
+        lines.append("你需要以下條件之一：")
+        
+        conditions = []
+        
+        if perms.get("admin_only", False):
+            conditions.append("• 伺服器管理員")
+        else:
+            if perms.get("require_manage_guild", True):
+                conditions.append("• 管理伺服器權限")
+            
+            allowed_roles = perms.get("allowed_roles", [])
+            if allowed_roles:
+                role_mentions = []
+                for role_id in allowed_roles[:5]:
+                    role = ctx.guild.get_role(int(role_id))
+                    if role:
+                        role_mentions.append(role.mention)
+                if role_mentions:
+                    conditions.append(f"• 擁有身份組：{', '.join(role_mentions)}")
+            
+            allowed_users = perms.get("allowed_users", [])
+            if allowed_users:
+                conditions.append(f"• 已被管理員授權（共 {len(allowed_users)} 人）")
+        
+        if conditions:
+            lines.append("\n".join(conditions))
+        
+        lines.append(f"\n使用 `!評核權限 查看` 了解詳情")
+        lines.append(f"使用 `!評核權限 幫助` 查看設定指令")
+        
+        return "\n".join(lines)
+    
+    # ============ 新增：權限管理指令 ============
+    
+    @commands.command(name="評核權限", aliases=["evalperms", "評核權限設定"])
+    @commands.has_permissions(administrator=True)
+    async def evaluation_permissions(self, ctx, 動作: str = "查看", *, 參數: str = None):
+        """評核系統權限管理（僅管理員）"""
+        
+        guild_id = ctx.guild.id
+        
+        if 動作 == "查看":
+            perms = self.get_guild_permissions(guild_id)
+            
+            embed = discord.Embed(
+                title="📋 評核系統權限設定",
+                description=f"伺服器：{ctx.guild.name}",
+                color=0x3498db
+            )
+            
+            basic_info = []
+            basic_info.append(f"**僅管理員可用:** {'✅' if perms.get('admin_only', False) else '❌'}")
+            basic_info.append(f"**需要管理伺服器權限:** {'✅' if perms.get('require_manage_guild', True) else '❌'}")
+            
+            embed.add_field(name="⚙️ 基本設定", value="\n".join(basic_info), inline=False)
+            
+            allowed_roles = []
+            for role_id in perms.get("allowed_roles", []):
+                role = ctx.guild.get_role(int(role_id))
+                if role:
+                    allowed_roles.append(f"{role.mention} (`{role_id}`)")
+            
+            embed.add_field(
+                name=f"👥 允許的角色 ({len(allowed_roles)})",
+                value="\n".join(allowed_roles) if allowed_roles else "無",
+                inline=False
+            )
+            
+            allowed_users = []
+            for user_id in perms.get("allowed_users", []):
+                member = ctx.guild.get_member(int(user_id))
+                if member:
+                    allowed_users.append(f"{member.mention} (`{user_id}`)")
+            
+            embed.add_field(
+                name=f"👤 允許的用戶 ({len(allowed_users)})",
+                value="\n".join(allowed_users) if allowed_users else "無",
+                inline=False
+            )
+            
+            has_perm = self.check_permission(ctx)
+            embed.add_field(
+                name="🔍 你的權限狀態",
+                value=f"{'✅ 有權限' if has_perm else '❌ 無權限'}",
+                inline=False
+            )
+            
+            embed.set_footer(text="使用 !評核權限 幫助 查看所有指令")
+            await ctx.send(embed=embed)
+        
+        elif 動作 == "幫助":
+            embed = discord.Embed(title="📖 評核權限指令幫助", color=0x7289da)
+            embed.add_field(name="查看設定", value="`!評核權限 查看`", inline=False)
+            embed.add_field(name="角色管理", value="`!評核權限 添加角色 @角色`\n`!評核權限 移除角色 @角色`", inline=False)
+            embed.add_field(name="用戶管理", value="`!評核權限 添加用戶 @用戶`\n`!評核權限 移除用戶 @用戶`", inline=False)
+            embed.add_field(name="權限設定", value="`!評核權限 管理權限 開啟/關閉`\n`!評核權限 僅管理員 開啟/關閉`\n`!評核權限 重置`", inline=False)
+            await ctx.send(embed=embed)
+        
+        elif 動作 == "添加角色":
+            if not ctx.message.role_mentions:
+                await ctx.send("❌ 請使用 @ 提及要添加的角色")
+                return
+            
+            role = ctx.message.role_mentions[0]
+            perms = self.get_guild_permissions(guild_id)
+            role_id_str = str(role.id)
+            allowed_roles = [str(r) for r in perms.get("allowed_roles", [])]
+            
+            if role_id_str in allowed_roles:
+                await ctx.send(f"ℹ️ 角色 {role.mention} 已經在允許列表中")
+                return
+            
+            if "allowed_roles" not in perms:
+                perms["allowed_roles"] = []
+            perms["allowed_roles"].append(int(role.id))
+            self.update_guild_permissions(guild_id, perms)
+            await ctx.send(f"✅ 已添加角色 {role.mention} 到允許列表")
+        
+        elif 動作 == "移除角色":
+            if not ctx.message.role_mentions:
+                await ctx.send("❌ 請使用 @ 提及要移除的角色")
+                return
+            
+            role = ctx.message.role_mentions[0]
+            perms = self.get_guild_permissions(guild_id)
+            role_id_str = str(role.id)
+            allowed_roles = [str(r) for r in perms.get("allowed_roles", [])]
+            
+            if role_id_str not in allowed_roles:
+                await ctx.send(f"ℹ️ 角色 {role.mention} 不在允許列表中")
+                return
+            
+            perms["allowed_roles"] = [r for r in perms.get("allowed_roles", []) if str(r) != role_id_str]
+            self.update_guild_permissions(guild_id, perms)
+            await ctx.send(f"✅ 已從允許列表中移除角色 {role.mention}")
+        
+        elif 動作 == "添加用戶":
+            if not ctx.message.mentions:
+                await ctx.send("❌ 請使用 @ 提及要添加的用戶")
+                return
+            
+            user = ctx.message.mentions[0]
+            perms = self.get_guild_permissions(guild_id)
+            user_id_str = str(user.id)
+            allowed_users = [str(u) for u in perms.get("allowed_users", [])]
+            
+            if user_id_str in allowed_users:
+                await ctx.send(f"ℹ️ 用戶 {user.mention} 已經在允許列表中")
+                return
+            
+            if "allowed_users" not in perms:
+                perms["allowed_users"] = []
+            perms["allowed_users"].append(int(user.id))
+            self.update_guild_permissions(guild_id, perms)
+            await ctx.send(f"✅ 已添加用戶 {user.mention} 到允許列表")
+        
+        elif 動作 == "移除用戶":
+            if not ctx.message.mentions:
+                await ctx.send("❌ 請使用 @ 提及要移除的用戶")
+                return
+            
+            user = ctx.message.mentions[0]
+            perms = self.get_guild_permissions(guild_id)
+            user_id_str = str(user.id)
+            allowed_users = [str(u) for u in perms.get("allowed_users", [])]
+            
+            if user_id_str not in allowed_users:
+                await ctx.send(f"ℹ️ 用戶 {user.mention} 不在允許列表中")
+                return
+            
+            perms["allowed_users"] = [u for u in perms.get("allowed_users", []) if str(u) != user_id_str]
+            self.update_guild_permissions(guild_id, perms)
+            await ctx.send(f"✅ 已從允許列表中移除用戶 {user.mention}")
+        
+        elif 動作 == "管理權限":
+            if 參數 not in ["開啟", "關閉"]:
+                await ctx.send("❌ 請指定 `開啟` 或 `關閉`")
+                return
+            
+            perms = self.get_guild_permissions(guild_id)
+            perms["require_manage_guild"] = (參數 == "開啟")
+            self.update_guild_permissions(guild_id, perms)
+            await ctx.send(f"✅ 已{'開啟' if 參數 == '開啟' else '關閉'}「需要管理伺服器權限」設定")
+        
+        elif 動作 == "僅管理員":
+            if 參數 not in ["開啟", "關閉"]:
+                await ctx.send("❌ 請指定 `開啟` 或 `關閉`")
+                return
+            
+            perms = self.get_guild_permissions(guild_id)
+            perms["admin_only"] = (參數 == "開啟")
+            self.update_guild_permissions(guild_id, perms)
+            await ctx.send(f"✅ 已{'開啟' if 參數 == '開啟' else '關閉'}「僅管理員可用」設定")
+        
+        elif 動作 == "重置":
+            confirm_embed = discord.Embed(
+                title="⚠️ 確認重置",
+                description="確定要重置評核系統權限設定嗎？\n這將恢復為默認設定。",
+                color=0xff9900
+            )
+            confirm_embed.set_footer(text="輸入 '確認重置' 以確認")
+            await ctx.send(embed=confirm_embed)
+            
+            def check(m):
+                return m.author == ctx.author and m.channel == ctx.channel and m.content == "確認重置"
+            
+            try:
+                await self.bot.wait_for('message', timeout=30.0, check=check)
+                self.permissions[str(guild_id)] = self.default_permissions.copy()
+                self.save_permissions()
+                await ctx.send("✅ 已重置評核系統權限設定")
+            except asyncio.TimeoutError:
+                await ctx.send("❌ 重置已取消")
+        
+        else:
+            await ctx.send("❌ 未知的動作，使用 `!評核權限 幫助` 查看可用指令")
+    
+    # ============ 新增：權限測試指令 ============
+    
+    @commands.command(name="測試權限")
+    async def test_permission(self, ctx):
+        """測試你是否擁有評核系統權限"""
+        if self.check_permission(ctx):
+            embed = discord.Embed(
+                title="✅ 權限測試通過",
+                description="你有權限使用評核系統！",
+                color=0x00ff00
+            )
+        else:
+            embed = discord.Embed(
+                title="❌ 權限測試失敗",
+                description=self.get_permission_error_message(ctx),
+                color=0xff0000
+            )
+        await ctx.send(embed=embed)
+    
+    # ============ 以下是你原本的程式碼，只修改創建評核活動指令 ============
+    
     def get_current_period(self):
         """獲取當前半月期"""
         now = datetime.now()
@@ -61,6 +390,13 @@ class Evaluation(commands.Cog):
     @commands.command(name="創建評核活動")
     async def create_evaluation(self, ctx, name: str, minutes: int, *, prize: str):
         """創建評核活動"""
+        
+        # ============ 新增：權限檢查 ============
+        if not self.check_permission(ctx):
+            error_msg = self.get_permission_error_message(ctx)
+            await ctx.send(error_msg)
+            return
+        # ============ 權限檢查結束 ============
         
         if name in self.evaluations:
             await ctx.send(f"❌ 已存在同名活動：{name}")
@@ -92,7 +428,7 @@ class Evaluation(commands.Cog):
             "guild_id": ctx.guild.id,
             "period": current_period,
             "allow_signup": True,
-            "selected_player": None  # 當前選擇的玩家
+            "selected_player": None
         }
         
         # 簽到訊息
@@ -148,14 +484,10 @@ class Evaluation(commands.Cog):
             
         activity = self.evaluations[activity_id]
         
-        # 關閉簽到
         activity["allow_signup"] = False
         activity["status"] = "rating"
         
-        # 發送簽到結束通知
         await ctx.send(f"⏰ 簽到已結束！現在進入評分階段。")
-        
-        # 顯示評分界面
         await self.show_rating_interface(ctx, activity_id)
 
     async def show_rating_interface(self, ctx, activity_id):
@@ -165,34 +497,28 @@ class Evaluation(commands.Cog):
             return
             
         activity = self.evaluations[activity_id]
-        
-        # 獲取參與者資訊
         participants_info = await self.get_participants_info(activity_id)
         
-        # 設定預設評分為"普通"
         for participant in participants_info:
             if participant["rating"] == "未評分":
                 activity["ratings"][participant["id"]] = "普通"
                 participant["rating"] = "普通"
                 
-                # 計算預設權重
                 weight = self.rating_weights["普通"]
                 if participant["class"] in self.class_bonus:
                     weight *= self.class_bonus[participant["class"]]
                 activity["weights"][participant["id"]] = weight
                 participant["weight"] = weight
         
-        # 創建評分界面
         embed = discord.Embed(
             title=f"⭐ 評分時間 - {activity['name']}",
             description=f"**活動ID:** `{activity_id}`\n**參與人數：** {len(participants_info)}人\n**抽獎物品：** {activity['prize']}",
             color=discord.Color.gold()
         )
         
-        # 參與者列表（只顯示前15人，其餘點擊按鈕查看）
         if participants_info:
             participants_text = ""
-            for i, participant in enumerate(participants_info[:15]):  # 只顯示前15人
+            for i, participant in enumerate(participants_info[:15]):
                 class_emoji = {
                     "坦克": "🛡️",
                     "输出": "⚔️",
@@ -220,7 +546,6 @@ class Evaluation(commands.Cog):
         else:
             embed.add_field(name="**📋 參與者列表**", value="暫無參與者", inline=False)
         
-        # 操作指南
         guide = (
             f"**🎮 EMOJI評分系統：**\n\n"
             f"**1. 選擇玩家：**\n"
@@ -236,24 +561,19 @@ class Evaluation(commands.Cog):
         
         embed.add_field(name="**📝 操作說明**", value=guide, inline=False)
         
-        # 總權重計算
         total_weight = sum(p["weight"] for p in participants_info if isinstance(p["weight"], (int, float)))
         embed.add_field(name="**[總權重]**", value=f"{total_weight:.1f}", inline=True)
         
-        # 發送評分界面
         rating_msg = await ctx.send(embed=embed)
         activity["rating_msg_id"] = rating_msg.id
         
-        # 添加玩家選擇按鈕（最多20個）
         max_players = min(len(participants_info), 20)
         for i in range(max_players):
             await rating_msg.add_reaction(self.number_emojis[i])
         
-        # 添加評分按鈕
         for emoji in self.rating_emojis.keys():
             await rating_msg.add_reaction(emoji)
         
-        # 添加抽獎按鈕
         await rating_msg.add_reaction("🎲")
         
         await ctx.send(f"💡 **提示：** 所有未評分玩家已預設為「普通」。請先按玩家按鈕，再按評級按鈕。")
@@ -274,21 +594,15 @@ class Evaluation(commands.Cog):
             except:
                 username = f"用戶{user_id[:4]}"
             
-            # 獲取職業選擇
             player_class = activity["class_selections"].get(user_id, "未選擇")
-            
-            # 獲取評分（如果已評）
             rating = activity["ratings"].get(user_id, "未評分")
             
-            # 計算權重
             weight = 1.0
             if rating in self.rating_weights:
                 weight = self.rating_weights[rating]
-                # 應用職業加成
                 if player_class in self.class_bonus:
                     weight *= self.class_bonus[player_class]
             elif rating == "未評分":
-                # 預設為普通
                 weight = self.rating_weights["普通"]
                 if player_class in self.class_bonus:
                     weight *= self.class_bonus[player_class]
@@ -314,12 +628,9 @@ class Evaluation(commands.Cog):
         user_id = str(user.id)
         channel = reaction.message.channel
         
-        # 查找對應的活動
         for activity_id, activity in self.evaluations.items():
-            # 處理簽到（僅在允許簽到時段內）
             if activity.get("signup_msg_id") == msg_id:
                 if not activity.get("allow_signup", True):
-                    # 超過簽到時間，移除反應
                     try:
                         await reaction.remove(user)
                     except:
@@ -327,7 +638,6 @@ class Evaluation(commands.Cog):
                     return
                 
                 if emoji == "✅":
-                    # 檢查是否在簽到時間內
                     if datetime.now() > activity["signup_end_time"]:
                         try:
                             await reaction.remove(user)
@@ -337,7 +647,6 @@ class Evaluation(commands.Cog):
                     
                     activity["attendees"].add(user_id)
                     
-                    # 初始化用戶數據
                     if user_id not in self.user_data:
                         self.user_data[user_id] = {
                             "name": user.name,
@@ -346,7 +655,6 @@ class Evaluation(commands.Cog):
                             "attendance_periods": {}
                         }
                     
-                    # 記錄出席（半月期）
                     period = activity["period"]
                     if period not in self.user_data[user_id]["attendance_periods"]:
                         self.user_data[user_id]["attendance_periods"][period] = {
@@ -354,7 +662,6 @@ class Evaluation(commands.Cog):
                             "attended": 0
                         }
                     
-                    # 增加該期總活動數（如果這是第一次參加此活動）
                     activity_key = f"{activity['name']}_{activity['start_time'].strftime('%Y%m%d%H%M%S')}"
                     if activity_key not in self.user_data[user_id].get("attended_events", set()):
                         if "attended_events" not in self.user_data[user_id]:
@@ -363,7 +670,6 @@ class Evaluation(commands.Cog):
                         self.user_data[user_id]["attended_events"].add(activity_key)
                         self.user_data[user_id]["attendance_periods"][period]["total_events"] += 1
                     
-                    # 增加出席次數
                     self.user_data[user_id]["attendance_periods"][period]["attended"] += 1
                     
                     try:
@@ -377,7 +683,6 @@ class Evaluation(commands.Cog):
                         activity["attendees"].discard(user_id)
                 return
             
-            # 處理職業選擇
             elif activity.get("class_msg_id") == msg_id:
                 if user_id in activity["attendees"]:
                     if emoji == "🛡️":
@@ -397,25 +702,21 @@ class Evaluation(commands.Cog):
                         pass
                 return
             
-            # 處理評分界面按鈕
             elif activity.get("rating_msg_id") == msg_id:
                 if user_id != str(activity["creator"]):
-                    return  # 只有HOST可以操作
+                    return
                 
-                # 獲取參與者列表
                 participants_info = await self.get_participants_info(activity_id)
                 if not participants_info:
                     await channel.send("❌ 沒有參與者可以評分！")
                     return
                 
-                # 處理玩家選擇按鈕
                 if emoji in self.number_emojis:
                     player_index = self.number_emojis.index(emoji)
                     if player_index < len(participants_info):
                         selected_player = participants_info[player_index]
                         activity["selected_player"] = selected_player["id"]
                         
-                        # 發送選擇確認
                         rating_emoji = {
                             "優秀": "⭐",
                             "普通": "🆗",
@@ -433,18 +734,15 @@ class Evaluation(commands.Cog):
                     else:
                         await channel.send("❌ 無效的玩家選擇！")
                 
-                # 處理評級按鈕
                 elif emoji in self.rating_emojis:
                     rating = self.rating_emojis[emoji]
                     
-                    # 檢查是否有選擇玩家
                     if "selected_player" not in activity:
                         await channel.send("❌ 請先選擇玩家（按數字/字母按鈕）！")
                         return
                     
                     player_id = activity["selected_player"]
                     
-                    # 找到玩家資訊
                     player_info = None
                     player_name = ""
                     for participant in participants_info:
@@ -457,13 +755,9 @@ class Evaluation(commands.Cog):
                         await channel.send("❌ 找不到玩家資訊！")
                         return
                     
-                    # 獲取舊評分
                     old_rating = activity["ratings"].get(player_id, "普通")
-                    
-                    # 記錄新評分
                     activity["ratings"][player_id] = rating
                     
-                    # 計算權重
                     player_class = activity["class_selections"].get(player_id, "未選擇")
                     weight = self.rating_weights[rating]
                     if player_class in self.class_bonus:
@@ -471,7 +765,6 @@ class Evaluation(commands.Cog):
                     
                     activity["weights"][player_id] = weight
                     
-                    # 更新用戶數據
                     if player_id not in self.user_data:
                         try:
                             player_user = await self.bot.fetch_user(int(player_id))
@@ -486,15 +779,12 @@ class Evaluation(commands.Cog):
                             "attendance_periods": {}
                         }
                     
-                    # 更新評分次數統計
                     if rating in self.user_data[player_id]["rating_counts"]:
                         self.user_data[player_id]["rating_counts"][rating] += 1
                     
-                    # 減少舊評分次數（如果不是普通）
                     if old_rating != "普通" and old_rating in self.user_data[player_id]["rating_counts"]:
                         self.user_data[player_id]["rating_counts"][old_rating] = max(0, self.user_data[player_id]["rating_counts"][old_rating] - 1)
                     
-                    # 記錄活動
                     activity_record = {
                         "name": activity["name"],
                         "rating": rating,
@@ -504,7 +794,6 @@ class Evaluation(commands.Cog):
                         "period": activity["period"]
                     }
                     
-                    # 檢查是否已記錄此活動
                     existing_index = -1
                     for i, record in enumerate(self.user_data[player_id]["activities"]):
                         if record["name"] == activity["name"]:
@@ -512,19 +801,15 @@ class Evaluation(commands.Cog):
                             break
                     
                     if existing_index >= 0:
-                        # 更新現有記錄
                         old_rating_in_record = self.user_data[player_id]["activities"][existing_index]["rating"]
                         if old_rating_in_record != rating:
-                            # 減少舊評分次數
                             if old_rating_in_record in self.user_data[player_id]["rating_counts"]:
                                 self.user_data[player_id]["rating_counts"][old_rating_in_record] = max(0, self.user_data[player_id]["rating_counts"][old_rating_in_record] - 1)
                         
                         self.user_data[player_id]["activities"][existing_index] = activity_record
                     else:
-                        # 新增記錄
                         self.user_data[player_id]["activities"].append(activity_record)
                     
-                    # 顯示評級EMOJI
                     rating_emoji_display = {
                         "優秀": "⭐",
                         "普通": "🆗",
@@ -534,7 +819,6 @@ class Evaluation(commands.Cog):
                     
                     await channel.send(f"✅ 已為 **{player_name}** 評級：{rating_emoji_display} **{rating}** (權重: {weight:.1f})")
                     
-                    # 通知玩家
                     try:
                         player_user = await self.bot.fetch_user(int(player_id))
                         rating_emoji_msg = {
@@ -548,14 +832,11 @@ class Evaluation(commands.Cog):
                     except:
                         pass
                     
-                    # 刷新評分界面
                     await self.refresh_rating_interface(channel, activity_id)
                     
-                    # 清除選擇的玩家
                     if "selected_player" in activity:
                         del activity["selected_player"]
                 
-                # 處理抽獎按鈕
                 elif emoji == "🎲":
                     await self.execute_lottery(channel, activity_id)
                 return
@@ -567,21 +848,17 @@ class Evaluation(commands.Cog):
             return
             
         activity = self.evaluations[activity_id]
-        
-        # 獲取參與者資訊
         participants_info = await self.get_participants_info(activity_id)
         
-        # 創建新的評分界面
         embed = discord.Embed(
             title=f"⭐ 評分時間 - {activity['name']}",
             description=f"**活動ID:** `{activity_id}`\n**參與人數：** {len(participants_info)}人\n**抽獎物品：** {activity['prize']}",
             color=discord.Color.gold()
         )
         
-        # 參與者列表
         if participants_info:
             participants_text = ""
-            for i, participant in enumerate(participants_info[:15]):  # 只顯示前15人
+            for i, participant in enumerate(participants_info[:15]):
                 class_emoji = {
                     "坦克": "🛡️",
                     "输出": "⚔️",
@@ -609,7 +886,6 @@ class Evaluation(commands.Cog):
         else:
             embed.add_field(name="**📋 參與者列表**", value="暫無參與者", inline=False)
         
-        # 操作指南
         guide = (
             f"**🎮 EMOJI評分系統：**\n\n"
             f"**1. 選擇玩家：**\n"
@@ -625,11 +901,9 @@ class Evaluation(commands.Cog):
         
         embed.add_field(name="**📝 操作說明**", value=guide, inline=False)
         
-        # 總權重計算
         total_weight = sum(p["weight"] for p in participants_info if isinstance(p["weight"], (int, float)))
         embed.add_field(name="**[總權重]**", value=f"{total_weight:.1f}", inline=True)
         
-        # 編輯原始訊息
         try:
             rating_msg = await channel.fetch_message(activity["rating_msg_id"])
             await rating_msg.edit(embed=embed)
@@ -645,15 +919,12 @@ class Evaluation(commands.Cog):
             
         activity = self.evaluations[activity_id]
         
-        # 檢查是否有評分
         if not activity["weights"]:
             await channel.send("❌ 還沒有任何評分，無法抽獎！")
             return
         
-        # 準備抽獎名單（根據權重）
         weighted_players = []
         for player_id, weight in activity["weights"].items():
-            # 權重四捨五入取整數，作為抽獎次數
             entries = max(1, round(weight))
             weighted_players.extend([player_id] * entries)
         
@@ -661,7 +932,6 @@ class Evaluation(commands.Cog):
             await channel.send("❌ 沒有可抽獎的玩家！")
             return
         
-        # 抽獎
         winner_id = random.choice(weighted_players)
         
         try:
@@ -670,7 +940,6 @@ class Evaluation(commands.Cog):
         except:
             winner_name = f"用戶{winner_id[:4]}"
         
-        # 獲取中獎者資料
         rating = activity["ratings"].get(winner_id, "普通")
         rating_emoji = {
             "優秀": "⭐",
@@ -682,7 +951,6 @@ class Evaluation(commands.Cog):
         player_class = activity["class_selections"].get(winner_id, "未選擇")
         weight = activity["weights"].get(winner_id, 1.0)
         
-        # 發送中獎訊息
         embed = discord.Embed(
             title="🎉 抽獎結果",
             description=f"**活動：** {activity['name']}\n**獎品：** {activity['prize']}",
@@ -695,14 +963,12 @@ class Evaluation(commands.Cog):
         
         await channel.send(embed=embed)
         
-        # 通知中獎者
         try:
             if winner:
                 await winner.send(f"🎉 恭喜！你在活動 **'{activity['name']}'** 中抽中了 **{activity['prize']}**！")
         except:
             pass
         
-        # 標記活動完成
         activity["status"] = "completed"
 
     def calculate_attendance_rate(self, user_id, period=None):
@@ -735,7 +1001,6 @@ class Evaluation(commands.Cog):
         user_id = str(ctx.author.id)
         current_period = self.get_current_period()
         
-        # 確保用戶數據存在
         if user_id not in self.user_data:
             self.user_data[user_id] = {
                 "name": ctx.author.name,
@@ -747,13 +1012,11 @@ class Evaluation(commands.Cog):
         
         data = self.user_data[user_id]
         
-        # 創建數據嵌入
         embed = discord.Embed(
             title=f"📊 {ctx.author.name} 的評核數據",
             color=discord.Color.green()
         )
         
-        # 顯示當前半月期出席率
         attendance_rate, total_events, attended, period_data = self.calculate_attendance_rate(user_id, current_period)
         
         attendance_info = (
@@ -771,7 +1034,6 @@ class Evaluation(commands.Cog):
             inline=False
         )
         
-        # 顯示評級次數統計（使用EMOJI）
         rating_counts = data["rating_counts"]
         total_ratings = sum(rating_counts.values())
         
@@ -799,9 +1061,8 @@ class Evaluation(commands.Cog):
             inline=False
         )
         
-        # 顯示最近活動記錄
         if data["activities"]:
-            recent_activities = data["activities"][-5:]  # 最近5個活動
+            recent_activities = data["activities"][-5:]
             activities_text = ""
             for activity in recent_activities:
                 rating_emoji = {
@@ -823,7 +1084,6 @@ class Evaluation(commands.Cog):
 
     @commands.command(name="所有人的數據", aliases=["所有數據", "全體數據"])
     async def all_stats(self, ctx):
-        """顯示所有人的數據，分頁顯示，每頁30人"""
         if not ctx.author.guild_permissions.administrator:
             await ctx.send("❌ 需要管理員權限！")
             return
@@ -832,15 +1092,12 @@ class Evaluation(commands.Cog):
             await ctx.send("📊 目前還沒有任何數據。")
             return
         
-        # 收集所有用戶數據
         user_stats = []
         current_period = self.get_current_period()
         
         for user_id, data in self.user_data.items():
-            # 計算當前半月期出席率
             attendance_rate, total_events, attended, _ = self.calculate_attendance_rate(user_id, current_period)
             
-            # 獲取評級次數
             excellent = data["rating_counts"]["優秀"]
             good = data["rating_counts"]["普通"]
             needs_improvement = data["rating_counts"]["待改進"]
@@ -858,14 +1115,11 @@ class Evaluation(commands.Cog):
                 "user_id": user_id
             })
         
-        # 按照出席率排序（高到低）
         user_stats.sort(key=lambda x: x["attendance_rate"], reverse=True)
         
-        # 分頁設定
         items_per_page = 30
         total_pages = (len(user_stats) + items_per_page - 1) // items_per_page
         
-        # 建立分頁瀏覽器
         class AllStatsPaginator(discord.ui.View):
             def __init__(self, user_stats, items_per_page, total_pages, current_period):
                 super().__init__(timeout=180)
@@ -886,7 +1140,6 @@ class Evaluation(commands.Cog):
                     color=discord.Color.blue()
                 )
                 
-                # 橫向顯示，每10人一欄，共3欄
                 columns = 3
                 rows_per_column = 10
                 
@@ -902,7 +1155,6 @@ class Evaluation(commands.Cog):
                         stat = current_page_stats[i]
                         rank = start_idx + i + 1
                         
-                        # 簡單化顯示，每行一個人
                         column_text += (
                             f"**{rank}. {stat['name']}**\n"
                             f"出席: {stat['attended']}/{stat['total_events']} ({stat['attendance_rate']}%)\n"
@@ -915,7 +1167,6 @@ class Evaluation(commands.Cog):
                         inline=True
                     )
                 
-                # 只在第一頁顯示統計摘要
                 if self.current_page == 0 and self.user_stats:
                     total_players = len(self.user_stats)
                     total_events = sum(stat["total_events"] for stat in self.user_stats)
@@ -951,7 +1202,6 @@ class Evaluation(commands.Cog):
                     self.current_page += 1
                     await interaction.response.edit_message(embed=await self.create_page_embed(), view=self)
             
-            # 更新按鈕狀態
             async def update_buttons(self):
                 self.previous_page.disabled = self.current_page == 0
                 self.next_page.disabled = self.current_page >= self.total_pages - 1
@@ -960,16 +1210,13 @@ class Evaluation(commands.Cog):
                 await self.update_buttons()
                 return True
         
-        # 建立分頁器並發送第一頁
         paginator = AllStatsPaginator(user_stats, items_per_page, total_pages, current_period)
         embed = await paginator.create_page_embed()
         
-        # 設定按鈕狀態
         paginator.previous_page.disabled = True
         paginator.next_page.disabled = total_pages <= 1
         
         await ctx.send(embed=embed, view=paginator)
 
-# 添加 setup 函式（這是載入 Cog 的入口點）
 async def setup(bot):
     await bot.add_cog(Evaluation(bot))
